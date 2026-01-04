@@ -11,14 +11,18 @@ import (
 	"strings"
 	"time"
 
-	// "time"
-
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"inshorts.com/inshorts-news-data-syncer/utils"
 
 	"github.com/elastic/go-elasticsearch/v9"
 	"github.com/elastic/go-elasticsearch/v9/esapi"
+)
+
+const (
+	indexName = "inshorts-news"
+	bulkSize  = 500
+	path      = "resources/news_data.json"
 )
 
 type Article struct {
@@ -42,7 +46,6 @@ func main() {
 	zerolog.TimeFieldFormat = "2006-01-02T15:04:05.000Z"
 	// Optional: force UTC to ensure 'Z' (Zulu time) is used instead of a numeric offset
 	zerolog.TimestampFieldName = "@timestamp" // example for compatibility with some log processors
-	logger := log.Logger
 
 	// I hardcoded locally, but production reads from env/secret manager.
 	username := os.Getenv("ES_USERNAME")
@@ -71,35 +74,37 @@ func main() {
 	// Elasticsearch client initialisation
 	es, err := elasticsearch.NewClient(cfg)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("failed to create elasticsearch client")
+		log.Fatal().Caller().Err(err).Msg("failed to create elasticsearch client")
 	}
 
-	index := "inshorts-news-new"
-
-	err = createMappingsSettings(index, es)
+	// Create index mapping before inserting data
+	err = createMappingsSettings(indexName, es)
 	if err != nil {
-		fmt.Printf("error while creating mappings in es. Reason: (%v)", err)
+		log.Error().Caller().Err(err).Msg("error while creating mappings in es")
 	}
 
+	// Load articles from json file
 	startTime := time.Now()
-	err = loadNewsFromFile(index, "/Users/keshavlodhi/GoProjects/inshorts-news-data-syncer/resources/news_data.json", es)
+	articles, err := loadArticles(path)
 	if err != nil {
-		fmt.Println("the error while inserting doc in es: ", err)
+		log.Fatal().Caller().Err(err).Msg("error while loading articles from json file")
 	}
-	elapsed := time.Since(startTime)
-	tookMs := elapsed.Milliseconds()
-	fmt.Println("time taken to insert documents in ES: ", tookMs)
+
+	// Insert articles into elastic by using bulk api
+	if err := bulkIndex(es, articles); err != nil {
+		log.Fatal().Caller().Err(err).Msg("error while inserting articles in es using bulk api")
+	}
+	log.Info().Caller().Msgf("indexed %d articles in %v milliseconds\n", len(articles), time.Since(startTime).Milliseconds())
 }
 
 func createMappingsSettings(index string, es *elasticsearch.Client) error {
+	// Check if index already exists
 	exists, _ := es.Indices.Exists([]string{index})
 	if exists.StatusCode == 200 {
 		return nil
 	}
 
 	// 1. Define the mapping and settings as a JSON string
-	// Note: The "type" mapping has been removed in modern ES versions (v7+)
-	// and is replaced by "properties" within the "mappings" object.
 	mapping := `{
 		"settings": {
 			"number_of_shards": 1,
@@ -147,40 +152,50 @@ func createMappingsSettings(index string, es *elasticsearch.Client) error {
 	// 3. Execute the request
 	res, err := req.Do(context.Background(), es)
 	if err != nil {
-		// Log the error. If the index already exists, ES will return an error.
-		log.Printf("Error creating index: %s", err)
 		return err
 	}
 	defer res.Body.Close()
 
 	if res.IsError() {
-		fmt.Printf("Error response: %s\n", res.String())
+		log.Error().Caller().Err(err).Msgf("error response: %s\n", res.String())
 	} else {
-		fmt.Printf("Index %s created successfully! Status: %s\n", index, res.Status())
+		log.Info().Caller().Err(err).Msgf("index: (%s) created successfully. Status: %s\n", index, res.Status())
 	}
 	return nil
 }
 
-func loadNewsFromFile(index string, path string, es *elasticsearch.Client) error {
+func loadArticles(path string) ([]Article, error) {
 	if _, err := os.Stat(path); err != nil {
-		return fmt.Errorf("file not found at path %s: %w", path, err)
+		return nil, fmt.Errorf("file not found at path %s: %w", path, err)
 	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var articles []Article
 	if err := json.Unmarshal(data, &articles); err != nil {
-		return err
+		return nil, err
 	}
+	return articles, nil
+}
 
-	for _, a := range articles {
+func bulkIndex(es *elasticsearch.Client, articles []Article) error {
+	var buf bytes.Buffer
+	ctx := context.Background()
+
+	for i, a := range articles {
 		formattedDate, err := utils.NormalizeToESDate(a.PublicationDate)
 		if err != nil {
 			return err
 		}
+		meta := fmt.Sprintf(
+			`{ "index": { "_index": "%s", "_id": "%s" } }%s`,
+			indexName, a.ID, "\n",
+		)
+		buf.WriteString(meta)
+
 		doc := map[string]interface{}{
 			"id":               a.ID,
 			"title":            a.Title,
@@ -198,33 +213,38 @@ func loadNewsFromFile(index string, path string, es *elasticsearch.Client) error
 			},
 		}
 
-		// a := Article{
-		// 	ID: a.ID,
-		// 	Title: a.Title,
-		// 	Description: a.Description,
-		// 	URL: a.URL,
-		// 	PublicationDate: a.PublicationDate,
-		// 	SourceName: a.SourceName,
-		// 	Category: a.Category,
-		// 	RelevanceScore: a.RelevanceScore,
-		// 	Latitude: a.Latitude,
-		// 	Longitude: a.Longitude,
-
-		// }
-
-		body, _ := json.Marshal(doc)
-		res, err := es.Index(index,
-			bytes.NewReader(body),
-			es.Index.WithDocumentID(a.ID),
-			es.Index.WithRefresh("true"),
-		)
+		body, err := json.Marshal(doc)
 		if err != nil {
 			return err
 		}
-		defer res.Body.Close()
-		if res.IsError() {
-			return fmt.Errorf("insertion failed: %s", res.String())
+		buf.Write(body)
+		buf.WriteByte('\n')
+
+		if (i+1)%bulkSize == 0 {
+			if err := flushBulk(ctx, es, &buf); err != nil {
+				return err
+			}
 		}
 	}
+
+	return flushBulk(ctx, es, &buf)
+}
+
+func flushBulk(ctx context.Context, es *elasticsearch.Client, buf *bytes.Buffer) error {
+	if buf.Len() == 0 {
+		return nil
+	}
+
+	res, err := es.Bulk(bytes.NewReader(buf.Bytes()), es.Bulk.WithContext(ctx))
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.IsError() {
+		return fmt.Errorf("bulk indexing failed: %s", res.String())
+	}
+
+	buf.Reset()
 	return nil
 }
