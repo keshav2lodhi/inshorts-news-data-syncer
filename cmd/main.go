@@ -105,48 +105,106 @@ func createMappingsSettings(index string, es *elasticsearch.Client) error {
 	}
 
 	// 1. Define the mapping and settings as a JSON string
-	mapping := `{
-		"settings": {
-			"number_of_shards": 1,
-			"number_of_replicas": 0
-		},
-		"mappings": {
-			"properties": {
-				"title": {
-					"type": "text"
-				},
-				"description": {
-					"type": "text"
-				},
-				"source_name": {
-					"type": "keyword"
-				},
-				"category": {
-					"type": "keyword"
-				},
-				"publication_date": {
-					"type": "date"
-				},
-				"relevance_score": {
-					"type": "float"
-				},
-				"latitude": {
-					"type": "float"
-				},
-				"longitude": {
-					"type": "float"
-				},
-				"location": {
-					"type": "geo_point"
-				}
-			}
-		}
-	}`
-
+	var settingsAndmappings = `
+{
+  "settings": {
+    "analysis": {
+      "analyzer": {
+        "news_text": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": [
+            "lowercase",
+            "stop",
+            "english_stemmer"
+          ]
+        }
+      },
+      "filter": {
+        "english_stemmer": {
+          "type": "stemmer",
+          "language": "english"
+        }
+      },
+      "normalizer": {
+        "keyword_lowercase": {
+          "type": "custom",
+          "filter": ["lowercase"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "id": {
+        "type": "keyword"
+      },
+	  "url": {
+  		"type": "keyword",
+  		"ignore_above": 2048
+	  },
+      "title": {
+        "type": "text",
+        "analyzer": "news_text",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "ignore_above": 256
+          }
+        }
+      },
+      "description": {
+        "type": "text",
+        "analyzer": "news_text"
+      },
+      "llm_summary": {
+        "type": "text",
+        "analyzer": "news_text"
+      },
+      "source_name": {
+        "type": "text",
+        "analyzer": "news_text",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "normalizer": "keyword_lowercase"
+          }
+        }
+      },
+      "category": {
+        "type": "text",
+        "analyzer": "news_text",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "normalizer": "keyword_lowercase"
+          }
+        }
+      },
+      "publication_date": {
+        "type": "date"
+      },
+      "location": {
+        "type": "geo_point"
+      },
+      "relevance_score": {
+        "type": "float"
+      },
+	  "latitude": {
+  		"type": "float"
+	  },
+	  "longitude": {
+  		"type": "float"
+	  }
+    }
+  }
+}
+`
 	// 2. Create the index creation request
 	req := esapi.IndicesCreateRequest{
 		Index: index,
-		Body:  strings.NewReader(mapping),
+		Body:  strings.NewReader(settingsAndmappings),
 	}
 
 	// 3. Execute the request
@@ -241,8 +299,26 @@ func flushBulk(ctx context.Context, es *elasticsearch.Client, buf *bytes.Buffer)
 	}
 	defer res.Body.Close()
 
-	if res.IsError() {
-		return fmt.Errorf("bulk indexing failed: %s", res.String())
+	var bulkResp struct {
+		Errors bool `json:"errors"`
+		Items  []map[string]struct {
+			Status int                    `json:"status"`
+			Error  map[string]interface{} `json:"error,omitempty"`
+		} `json:"items"`
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(&bulkResp); err != nil {
+		return err
+	}
+
+	if bulkResp.Errors {
+		for _, item := range bulkResp.Items {
+			for _, action := range item {
+				if action.Error != nil {
+					return fmt.Errorf("bulk item failed: %+v", action.Error)
+				}
+			}
+		}
 	}
 
 	buf.Reset()
